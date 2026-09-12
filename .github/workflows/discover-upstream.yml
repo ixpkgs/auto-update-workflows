@@ -1,0 +1,175 @@
+name: Discover upstream versions
+
+on:
+  workflow_call:
+    inputs:
+      discovery_mode:
+        description: Upstream version source (tags or releases)
+        required: false
+        type: string
+        default: tags
+      upstream_repository:
+        description: Git repository whose versions should be discovered
+        required: true
+        type: string
+      upstream_github_repository:
+        description: GitHub owner/repository used in releases mode
+        required: false
+        type: string
+        default: ""
+      tag_pattern:
+        description: Bash regular expression used to select version tags
+        required: false
+        type: string
+        default: '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+      include_prereleases:
+        description: Include GitHub prereleases in releases mode
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      candidates_json:
+        description: Version candidates as a JSON array of tag and commit objects
+        value: ${{ jobs.discover.outputs.candidates_json }}
+      has_updates:
+        description: Whether at least one unprocessed version was found
+        value: ${{ jobs.discover.outputs.has_updates }}
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    env:
+      DISCOVERY_MODE: ${{ inputs.discovery_mode }}
+      INCLUDE_PRERELEASES: ${{ inputs.include_prereleases }}
+      TAG_PATTERN: ${{ inputs.tag_pattern }}
+      UPSTREAM_GITHUB_REPOSITORY: ${{ inputs.upstream_github_repository }}
+      UPSTREAM_REPOSITORY: ${{ inputs.upstream_repository }}
+    outputs:
+      candidates_json: ${{ steps.discover.outputs.candidates_json }}
+      has_updates: ${{ steps.discover.outputs.has_updates }}
+    steps:
+      - name: Check out the caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Discover unprocessed upstream versions
+        id: discover
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          if [[ -z "$UPSTREAM_REPOSITORY" || -z "$TAG_PATTERN" ]]; then
+            echo "upstream_repository and tag_pattern must not be empty." >&2
+            exit 1
+          fi
+
+          case "$DISCOVERY_MODE" in
+            tags | releases) ;;
+            *)
+              echo "discovery_mode must be tags or releases: $DISCOVERY_MODE" >&2
+              exit 1
+              ;;
+          esac
+
+          set +e
+          [[ "" =~ $TAG_PATTERN ]]
+          regex_status=$?
+          set -e
+          if (( regex_status == 2 )); then
+            echo "tag_pattern is not a valid Bash regular expression: $TAG_PATTERN" >&2
+            exit 1
+          fi
+
+          release_tags=""
+          if [[ "$DISCOVERY_MODE" == releases ]]; then
+            if [[ ! "$UPSTREAM_GITHUB_REPOSITORY" =~ ^[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+$ ]]; then
+              echo "upstream_github_repository must be an owner/repository name in releases mode." >&2
+              exit 1
+            fi
+
+            release_filter='.[] | select(.draft == false)'
+            if [[ "$INCLUDE_PRERELEASES" != true ]]; then
+              release_filter+=' | select(.prerelease == false)'
+            fi
+            release_filter+=' | .tag_name'
+
+            release_tags=$(
+              gh api --paginate \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "/repos/$UPSTREAM_GITHUB_REPOSITORY/releases?per_page=100" \
+                --jq "$release_filter"
+            )
+          fi
+
+          upstream_refs=$(git ls-remote --tags "$UPSTREAM_REPOSITORY")
+          mapfile -t candidates < <(
+            # Prefer peeled commits for annotated tags. Lightweight tags only
+            # produce the unpeeled line, whose value is already a commit.
+            awk '
+              $2 ~ /^refs\/tags\// {
+                ref = $2
+                peeled = sub(/\^\{\}$/, "", ref)
+                tag = substr(ref, length("refs/tags/") + 1)
+                if (!(tag in commits) || peeled) {
+                  commits[tag] = $1
+                }
+              }
+              END {
+                for (tag in commits) {
+                  printf "%s\t%s\n", tag, commits[tag]
+                }
+              }
+            ' <<< "$upstream_refs" |
+            while IFS=$'\t' read -r tag commit; do
+              # Downstream updaters may substitute these values into source
+              # files. Keep the shared output safe and unambiguous.
+              if [[ ! "$tag" =~ ^[0-9A-Za-z._+-]+$ ]]; then
+                echo "Ignoring unsafe tag: $tag" >&2
+                continue
+              fi
+
+              if [[ ! "$tag" =~ $TAG_PATTERN ]]; then
+                continue
+              fi
+
+              if [[ "$DISCOVERY_MODE" == releases ]] &&
+                ! grep -Fxq -- "$tag" <<< "$release_tags"
+              then
+                continue
+              fi
+
+              if ! git show-ref --verify --quiet "refs/tags/$tag"; then
+                printf '%s\t%s\n' "$tag" "$commit"
+              fi
+            done | sort -V -k1,1
+          )
+
+          candidates_json=$(
+            printf '%s\n' "${candidates[@]}" |
+              jq -Rsc '[
+                split("\n")[]
+                | select(length > 0)
+                | split("\t")
+                | {tag: .[0], commit: .[1]}
+              ]'
+          )
+
+          if (( ${#candidates[@]} == 0 )); then
+            echo "No new upstream $DISCOVERY_MODE found."
+            has_updates=false
+          else
+            printf 'New upstream %s (oldest first):\n' "$DISCOVERY_MODE"
+            printf '  %s\n' "${candidates[@]%%$'\t'*}"
+            has_updates=true
+          fi
+
+          echo "candidates_json=$candidates_json" >> "$GITHUB_OUTPUT"
+          echo "has_updates=$has_updates" >> "$GITHUB_OUTPUT"
